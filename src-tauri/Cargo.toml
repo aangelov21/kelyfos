@@ -1,0 +1,50 @@
+[package]
+name = "kelyfos"
+version = "0.1.0"
+description = "A local-first SSH and terminal workspace manager"
+authors = ["Spiros Sklavenitis"]
+license = "MIT"
+repository = "https://github.com/spirossorips/kelyfos"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "kelyfos_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+tokio = { version = "1.52.4", features = ["full"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+base64 = "0.22.1"
+dirs = "6.0.0"
+chrono = "0.4.45"
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-fs = "2.5.1"
+portable-pty = "0.9.0"
+shell-words = "1.1.1"
+fontdb = "0.23.0"
+ttf-parser = "0.25.1"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+
+
+# Time control for the startup engine's tests: `start_paused` needs test-util,
+# which is not part of tokio's "full". Test-only, so it stays out of the app.
+[dev-dependencies]
+tokio = { version = "1.52.4", features = ["test-util"] }
+
+[target."cfg(windows)".dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

@@ -1,0 +1,77 @@
+name: release
+
+# Releases are cut by pushing a tag. Nothing builds on a normal push — a Tauri
+# matrix build is slow and there is no reason to pay for it on every commit.
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets you exercise the whole matrix from the Actions tab without tagging.
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      # tauri-action creates the draft release and uploads bundles to it.
+      contents: write
+
+    strategy:
+      # One platform failing should not throw away the others' artifacts —
+      # you can re-run the single failed job instead of the whole matrix.
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is Apple Silicon; the x86_64 build is a cross-compile
+          # on the same runner, which Apple's toolchain handles natively.
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Keyed on the target so the two macOS jobs don't fight over one cache.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: ${{ matrix.target }}
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Without these two the build still produces installers and only
+          # fails at the very end, on the update signature. Both are required.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Kelyfos ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install."
+          # Draft so you can write notes and sanity-check the assets before
+          # anyone's updater sees it: `releases/latest` skips drafts, so
+          # publishing the draft is what actually ships the update.
+          releaseDraft: true
+          prerelease: false
+          # Generates latest.json (signatures + asset URLs) and uploads it to
+          # the release. This is the file plugins.updater.endpoints points at.
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}

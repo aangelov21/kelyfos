@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Secrets and local databases — never commit these to a public repo
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Screenshots and scratch images dropped at the repo root. Leading slash keeps
+# this to the root only, so app icons (src-tauri/icons/) and bundled assets
+# (src/assets/, public/) are untouched.
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+
+# Debug artifacts written by the Playwright MCP browser tool
+.playwright-mcp/
+
+# Editor directories and files
+.vscode/
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
