@@ -152,6 +152,19 @@ pub fn workspace_import(db: tauri::State<Db>, json_text: String) -> Result<Impor
         serde_json::from_value(parsed.get("workspace").cloned().ok_or("missing workspace")?)
             .map_err(|e| format!("invalid workspace: {}", e))?;
 
+    // Check every connection before writing anything. `connections_save` would
+    // refuse a bad one anyway, but only after the workspace and the terminals
+    // before it exist, leaving a half-imported workspace behind. Trimmed the
+    // same way `connections_save` trims, so both agree on what passes.
+    for ec in exported.terminals.iter().filter_map(|t| t.connection.as_ref()) {
+        let key_path = match ec.auth_method {
+            AuthMethod::Key => ec.key_path.as_deref().map(str::trim),
+            AuthMethod::Password => None,
+        };
+        check_ssh_target(ec.username.trim(), ec.host.trim(), key_path)
+            .map_err(|e| format!("Nothing was imported: connection \"{}\" is invalid. {e}", ec.name))?;
+    }
+
     let existing_connections = storage::connections_list(db.clone())?;
 
 

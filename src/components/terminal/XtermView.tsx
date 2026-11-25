@@ -163,7 +163,17 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
         term.cols,
         term.rows
       )
-      .catch((e) => setStatus(terminalId, { status: "error", message: String(e) }));
+      .catch((e) => {
+        setStatus(terminalId, { status: "error", message: String(e) });
+        // No shell started, so the pane is otherwise blank; say why in it, the
+        // way a status event's error is painted below. Covers a connection
+        // `pty_open` refused as well as a PTY that could not be allocated.
+        // Control characters are stripped: the message quotes the connection's
+        // name, which an imported file chose, and xterm would act on an escape
+        // sequence hidden in it.
+        const message = String(e).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+        term.writeln(`\x1b[31m✖ ${message}\x1b[0m`);
+      });
   };
 
   // Create the terminal once.

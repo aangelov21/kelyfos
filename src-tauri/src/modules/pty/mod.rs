@@ -163,7 +163,17 @@ fn build_ssh_command(conn: &Connection, windows_shell: bool) -> String {
             parts.push(quote_key_path(key_path, windows_shell));
         }
     }
-    parts.push(format!("{}@{}", conn.username, conn.host));
+    // The destination is only safe to type because `check_ssh_target` has kept
+    // every shell-special character out of it. A backslash (`DOMAIN\user`) is
+    // the one it allows that a POSIX shell would eat, hence the quote there;
+    // `shell_words` leaves a plain `user@host` bare. On Windows the backslash is
+    // literal in cmd and PowerShell alike, and nothing else needs quoting.
+    let destination = format!("{}@{}", conn.username, conn.host);
+    if windows_shell {
+        parts.push(destination);
+    } else {
+        parts.push(shell_words::quote(&destination).into_owned());
+    }
     parts.join(" ")
 }
 
@@ -198,6 +208,15 @@ pub async fn pty_open(
             .unwrap_or(true);
         (conn, startup_tasks, vars, integration_enabled)
     };
+
+    // `connections_save` checks every connection it stores, but rows saved
+    // before that check existed, or edited in the database by hand, never went
+    // through it. Refuse here too, before a shell exists to type into.
+    if let Some(c) = &conn {
+        c.check_ssh_target().map_err(|e| {
+            format!("Connection \"{}\" was not opened. {e} Edit the connection to fix it.", c.name)
+        })?;
+    }
 
     // Replace any existing session for this terminal (reconnect).
     close_session(&app, &terminal_id);
@@ -830,6 +849,16 @@ mod tests {
             build_ssh_command(&c, true),
             r"ssh -i C:\Users\u\.ssh\id_rsa root@example.com"
         );
+    }
+
+    /// `DOMAIN\user` reaches ssh intact: a POSIX shell would drop the backslash
+    /// unquoted, cmd and PowerShell keep it as typed.
+    #[test]
+    fn quotes_backslash_username_only_for_posix() {
+        let mut c = conn(AuthMethod::Password, 22, None);
+        c.username = r"CORP\alice".into();
+        assert_eq!(build_ssh_command(&c, false), r"ssh 'CORP\alice@example.com'");
+        assert_eq!(build_ssh_command(&c, true), r"ssh CORP\alice@example.com");
     }
 
     /// A space still needs quoting on Windows, in the one form cmd, powershell

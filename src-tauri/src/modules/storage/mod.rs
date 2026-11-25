@@ -89,6 +89,17 @@ pub fn connections_list(db: tauri::State<Db>) -> Result<Vec<Connection>, String>
 
 #[tauri::command]
 pub fn connections_save(db: tauri::State<Db>, mut connection: Connection) -> Result<Connection, String> {
+    // A pasted host brings its trailing space or newline with it, and the
+    // checks below refuse both; trimming is what the user meant. Every save
+    // path ends here (dialog, workspace import, settings restore), so this is
+    // the one gate a connection passes before its fields can be typed.
+    connection.host = connection.host.trim().to_string();
+    connection.username = connection.username.trim().to_string();
+    if let Some(path) = connection.key_path.as_mut() {
+        *path = path.trim().to_string();
+    }
+    connection.check_ssh_target()?;
+
     let conn = db.0.lock().unwrap();
     if connection.id.is_empty() {
         connection.id = uuid::Uuid::new_v4().to_string();
