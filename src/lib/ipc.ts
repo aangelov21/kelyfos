@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, type Channel } from "@tauri-apps/api/core";
 import type {
   AgentSnapshot,
   ClaudeHealth,
@@ -76,7 +76,9 @@ export const ipc = {
     shell: string | null,
     cwd: string | null,
     cols: number,
-    rows: number
+    rows: number,
+    /** Receives this session's output as raw bytes, in order. */
+    onData: Channel<ArrayBuffer>
   ) =>
     invoke<void>("pty_open", {
       terminalId,
@@ -86,12 +88,16 @@ export const ipc = {
       cwd,
       cols,
       rows,
+      onData,
     }),
   ptyWrite: (terminalId: string, data: string) =>
     invoke<void>("pty_write", { terminalId, data }),
   ptyResize: (terminalId: string, cols: number, rows: number) =>
     invoke<void>("pty_resize", { terminalId, cols, rows }),
   ptyClose: (terminalId: string) => invoke<void>("pty_close", { terminalId }),
+  /** Flow control: stop reading this terminal's PTY until `ptyResume`. */
+  ptyPause: (terminalId: string) => invoke<void>("pty_pause", { terminalId }),
+  ptyResume: (terminalId: string) => invoke<void>("pty_resume", { terminalId }),
   /** Working directory of a live terminal, or null if it can't be read. */
   ptyCwd: (terminalId: string) =>
     invoke<string | null>("pty_cwd", { terminalId }),

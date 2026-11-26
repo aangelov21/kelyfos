@@ -1,9 +1,14 @@
 //! Local PTY session management built on portable-pty.
 //! Each open terminal owns one local shell process on a real PTY, driven by a
 //! reader thread plus a command task. The frontend talks to it through Tauri
-//! commands; output and status flow back as Tauri events:
-//!   pty:data:{terminalId}    base64-encoded bytes
-//!   pty:status:{terminalId}  { status, message }
+//! commands; output and status flow back to it:
+//!   output                   raw bytes, over the `Channel` handed to `pty_open`
+//!   pty:status:{terminalId}  { status, message }, as a Tauri event
+//!
+//! Output is a channel rather than an event because an event is a JSON string:
+//! every read used to be base64-encoded (a third larger), serialised, parsed and
+//! decoded again. A channel delivers the bytes as an ArrayBuffer, in order, and
+//! its pace is set by the frontend — see `Flow`.
 //!
 //! This is the primary session backend. A saved connection does not get its own
 //! transport — the shell simply has an `ssh …` command typed into it, exactly as
@@ -13,11 +18,12 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
@@ -41,6 +47,64 @@ static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 /// noise — the numbers are in `docs/windows-process-detection.md` §6.
 const POLL_MS: u64 = 350;
 
+/// Bytes asked of the PTY per read. A read returns whatever is ready, so a
+/// quiet terminal still gets each keystroke's echo on its own; only a flood
+/// fills it, and then arrives in eight times fewer messages than at the old
+/// 8 KiB for the webview to dispatch.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Read-side flow control for one session, driven by the frontend.
+///
+/// xterm parses what it is handed asynchronously and buffers the rest without
+/// limit. So a `cat` of a large log used to be read off the PTY as fast as the
+/// program could write it and queued in the webview, until the UI stalled and
+/// memory climbed, and Ctrl+C took effect only after everything already queued
+/// had been drawn. The frontend now counts the bytes xterm has not parsed yet
+/// and calls `pty_pause` above a high-water mark, `pty_resume` below a low one.
+/// While paused the reader stops reading: the PTY's own buffer fills and the
+/// program blocks on its next write, which is what a real terminal does to a
+/// program that outruns it.
+#[derive(Default)]
+pub struct Flow {
+    paused: Mutex<bool>,
+    resumed: Condvar,
+}
+
+/// A pause that outlives this is taken for a lost `pty_resume` (a webview that
+/// reloaded mid-burst, an IPC call that failed) and read through. At worst that
+/// costs one unpaced burst; a terminal frozen until it is restarted would be
+/// worse. Far above the time xterm needs to parse a high-water mark's worth.
+const MAX_PAUSE: Duration = Duration::from_secs(10);
+
+impl Flow {
+    fn set_paused(&self, paused: bool) {
+        *self.paused.lock().unwrap() = paused;
+        if !paused {
+            self.resumed.notify_all();
+        }
+    }
+
+    /// Block the reader while paused, for at most `MAX_PAUSE`.
+    fn wait_until_resumed(&self) {
+        self.wait_at_most(MAX_PAUSE);
+    }
+
+    fn wait_at_most(&self, max: Duration) {
+        let deadline = Instant::now() + max;
+        let mut paused = self.paused.lock().unwrap();
+        while *paused {
+            let now = Instant::now();
+            if now >= deadline {
+                // Cleared, not just skipped: left set, the next read would
+                // wait another full `MAX_PAUSE`, and the terminal would crawl.
+                *paused = false;
+                break;
+            }
+            paused = self.resumed.wait_timeout(paused, deadline - now).unwrap().0;
+        }
+    }
+}
+
 pub struct SessionHandle {
     pub tx: mpsc::UnboundedSender<SessionCmd>,
     /// Milliseconds (since session start) of the last received output byte.
@@ -63,6 +127,8 @@ pub struct SessionHandle {
     #[cfg_attr(not(windows), allow(dead_code))]
     poll_busy: bool,
     instance: u64,
+    /// Paused and resumed by `pty_pause` / `pty_resume`.
+    flow: Arc<Flow>,
 }
 
 #[derive(Default)]
@@ -190,6 +256,9 @@ pub async fn pty_open(
     cwd: Option<String>,
     cols: u32,
     rows: u32,
+    // Where this session's output goes. One per `pty_open`, so a reconnect
+    // never interleaves the old session's last bytes into the new stream.
+    on_data: Channel<InvokeResponseBody>,
 ) -> Result<(), String> {
     let (conn, startup_tasks, vars, integration_enabled) = {
         let db = app.state::<Db>();
@@ -306,6 +375,7 @@ pub async fn pty_open(
     let poll_busy = connection_id.is_none() && !integrated;
 
     let instance = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+    let flow = Arc::new(Flow::default());
     {
         let manager = app.state::<PtyManager>();
         manager.0.lock().unwrap().insert(
@@ -318,6 +388,7 @@ pub async fn pty_open(
                 shell_pid,
                 poll_busy,
                 instance,
+                flow: flow.clone(),
             },
         );
     }
@@ -392,10 +463,9 @@ pub async fn pty_open(
     let last_output_reader = last_output_ms.clone();
     let tx_reader = tx.clone();
     let is_remote = connection_id.is_some();
+    let flow_reader = flow.clone();
     std::thread::spawn(move || {
-        let data_event = format!("pty:data:{}", tid_reader);
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; READ_CHUNK];
         let mut scanner = MarkScanner::default();
         // A failed command holds the error status until the next command starts
         // or the user looks at the tab; without the latch the prompt mark that
@@ -403,12 +473,15 @@ pub async fn pty_open(
         let mut failed = false;
         let mut saw_command = false;
         loop {
+            flow_reader.wait_until_resumed();
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break, // shell exited or the PTY closed
                 Ok(n) => {
                     last_output_reader
                         .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    app_reader.emit(&data_event, b64.encode(&buf[..n])).ok();
+                    // Fails only once the webview end of the channel is gone (a
+                    // reload); the session is torn down from that side.
+                    on_data.send(InvokeResponseBody::Raw(buf[..n].to_vec())).ok();
 
                     if !integrated {
                         continue;
@@ -463,6 +536,7 @@ pub async fn pty_open(
     // Writer: input and resizes arrive on the command channel.
     let app_writer = app.clone();
     let tid_writer = terminal_id.clone();
+    let flow_writer = flow;
     tauri::async_runtime::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -479,6 +553,9 @@ pub async fn pty_open(
         // Killing the child drops the master, which unblocks the reader thread.
         child.kill().ok();
         child.wait().ok();
+        // A reader parked by a pause is not in `read` and would never see the
+        // EOF; release it so the thread can exit.
+        flow_writer.set_paused(false);
         // Silent when a reconnect already replaced us — otherwise this stale
         // teardown would mark the live session disconnected.
         if remove_session(&app_writer, &tid_writer, instance) {
@@ -549,6 +626,31 @@ pub fn pty_resize(app: AppHandle, terminal_id: String, cols: u32, rows: u32) -> 
 #[tauri::command]
 pub fn pty_close(app: AppHandle, terminal_id: String) {
     close_session(&app, &terminal_id);
+}
+
+/// Flow control from the frontend; see `Flow`. A terminal with no session
+/// (closed, or not open yet) has nothing to pace, so neither is an error.
+#[tauri::command]
+pub fn pty_pause(app: AppHandle, terminal_id: String) {
+    set_paused(&app, &terminal_id, true);
+}
+
+#[tauri::command]
+pub fn pty_resume(app: AppHandle, terminal_id: String) {
+    set_paused(&app, &terminal_id, false);
+}
+
+fn set_paused(app: &AppHandle, terminal_id: &str, paused: bool) {
+    // Clone the handle out first: the reader holds the flow's own lock while it
+    // waits, and the session map is not something to hold across that.
+    let flow = {
+        let manager = app.state::<PtyManager>();
+        let map = manager.0.lock().unwrap();
+        map.get(terminal_id).map(|s| s.flow.clone())
+    };
+    if let Some(flow) = flow {
+        flow.set_paused(paused);
+    }
 }
 
 /// Start the Windows fallback busy poller. One task for the whole app rather
@@ -776,6 +878,43 @@ fn foreground_pid(_session: &SessionHandle) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_does_not_block_when_not_paused() {
+        let flow = Flow::default();
+        let start = Instant::now();
+        flow.wait_at_most(Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn flow_resume_releases_a_waiting_reader() {
+        let flow = Arc::new(Flow::default());
+        flow.set_paused(true);
+        let resumer = flow.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            resumer.set_paused(false);
+        });
+        let start = Instant::now();
+        flow.wait_at_most(Duration::from_secs(5));
+        let waited = start.elapsed();
+        handle.join().unwrap();
+        assert!(waited >= Duration::from_millis(40), "returned early: {waited:?}");
+        assert!(waited < Duration::from_secs(2), "missed the resume: {waited:?}");
+    }
+
+    /// A lost resume must not freeze the terminal: the wait ends on its own and
+    /// clears the flag, so the next read does not wait all over again.
+    #[test]
+    fn flow_reads_through_a_pause_nobody_resumes() {
+        let flow = Flow::default();
+        flow.set_paused(true);
+        flow.wait_at_most(Duration::from_millis(30));
+        let start = Instant::now();
+        flow.wait_at_most(Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
 
     fn conn(auth: AuthMethod, port: u16, key_path: Option<&str>) -> Connection {
         Connection {

@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
 
@@ -113,12 +114,39 @@ function refreshAtlasesSoon() {
   }
 }
 
-/** One character per byte, as `atob` and the highlighter both work in. */
+/** One character per byte, the form the highlighter works in. */
 function latin1ToBytes(bin: string): Uint8Array {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
 }
+
+/**
+ * The inverse of `latin1ToBytes`. Not `TextDecoder("latin1")`: the Encoding
+ * standard maps that label to windows-1252, which rewrites 0x80–0x9f and would
+ * corrupt the UTF-8 continuation bytes passing through. Sliced, because one
+ * `fromCharCode` call over a whole 64 KiB read can exceed the engine's limit on
+ * argument count.
+ */
+function bytesToLatin1(bytes: Uint8Array): string {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x2000) {
+    const slice = bytes.subarray(i, i + 0x2000);
+    text += String.fromCharCode.apply(null, slice as unknown as number[]);
+  }
+  return text;
+}
+
+/**
+ * Flow-control watermarks, in bytes handed to xterm but not yet parsed (see
+ * `Flow` in pty/mod.rs). xterm parses several MB/s at the very least, so the
+ * high mark is well under a tenth of a second of work: enough slack that a
+ * fast program never stalls on the pause/resume round trip, little enough
+ * that Ctrl+C on a runaway `cat` stops it within a screenful or two rather
+ * than after megabytes that were already queued.
+ */
+const HIGH_WATER = 512 * 1024;
+const LOW_WATER = 128 * 1024;
 
 interface Props {
   terminalId: string;
@@ -144,7 +172,11 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
 
   // Every terminal is a local shell. A saved connection just gets an `ssh …`
   // line typed into it, so the pane stays usable whether or not that succeeds.
-  const connect = () => {
+  // `prepare` turns each chunk of output into what xterm is handed. Returns
+  // the function that detaches this view from the session's output.
+  const connect = (
+    prepare: (bytes: Uint8Array) => Uint8Array
+  ): (() => void) | undefined => {
     const term = termRef.current;
     if (!term) return;
     const chosenShell =
@@ -152,6 +184,31 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
     // Set when this terminal was opened from another one, to start in the same
     // directory; otherwise the backend uses the home directory.
     const cwd = useTerminalsStore.getState().cwds[terminalId] ?? null;
+
+    // A channel of its own per session, created before the call so not even
+    // the shell's first bytes can arrive with nobody listening. The counters
+    // live here too: a write callback still due from a previous session must
+    // not unbalance this one's.
+    let pending = 0;
+    let paused = false;
+    const output = new Channel<ArrayBuffer>();
+    output.onmessage = (buffer) => {
+      const data = prepare(new Uint8Array(buffer));
+      const size = data.length;
+      pending += size;
+      term.write(data, () => {
+        pending -= size;
+        if (paused && pending <= LOW_WATER) {
+          paused = false;
+          ipc.ptyResume(terminalId).catch(() => {});
+        }
+      });
+      if (!paused && pending >= HIGH_WATER) {
+        paused = true;
+        ipc.ptyPause(terminalId).catch(() => {});
+      }
+    };
+
     setStatus(terminalId, { status: "connecting" });
     ipc
       .ptyOpen(
@@ -161,7 +218,8 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
         chosenShell,
         cwd,
         term.cols,
-        term.rows
+        term.rows,
+        output
       )
       .catch((e) => {
         setStatus(terminalId, { status: "error", message: String(e) });
@@ -174,6 +232,17 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
         const message = String(e).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
         term.writeln(`\x1b[31m✖ ${message}\x1b[0m`);
       });
+
+    // The channel outlives this view: the reader keeps sending until the
+    // shell is actually dead, and what it sent is still in flight after that.
+    // Those last bytes must not reach a disposed xterm, mark activity on a
+    // closed tab, or — worst — call `ptyPause` under this terminal's id once a
+    // reconnect has opened a new session there, which would freeze the new
+    // one until `MAX_PAUSE` gave up on it. The channel itself unregisters when
+    // the backend drops its end.
+    return () => {
+      output.onmessage = () => {};
+    };
   };
 
   // Create the terminal once.
@@ -327,9 +396,10 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
     // setting was turned back on if the stream had been skipped meanwhile.
     const highlight = createOutputHighlighter();
 
-    const unlistenData = listen<string>(`pty:data:${terminalId}`, (event) => {
+    const prepareOutput = (bytes: Uint8Array): Uint8Array => {
       const enabled = useSettingsStore.getState().terminal.highlightOutput;
-      term.write(latin1ToBytes(highlight(atob(event.payload), enabled)));
+      const text = bytesToLatin1(bytes);
+      const coloured = highlight(text, enabled);
 
       // "Was anyone looking when this arrived?" An unselected tab — and every
       // terminal of a workspace that is not the open one — is display:none and
@@ -342,7 +412,12 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
       if (!watched && Date.now() > quietUntil) {
         useTerminalsStore.getState().noteActivity(terminalId);
       }
-    });
+
+      // Colouring only ever inserts sequences, so an unchanged length means an
+      // unchanged chunk: hand xterm the bytes as they came and skip the copy
+      // back. That is every chunk with colouring off, and most with it on.
+      return coloured.length === text.length ? bytes : latin1ToBytes(coloured);
+    };
     const unlistenStatus = listen<{ status: TerminalStatus; message?: string }>(
       `pty:status:${terminalId}`,
       (event) => {
@@ -386,14 +461,14 @@ export function XtermView({ terminalId, connectionId, workspaceId, shell }: Prop
     observer.observe(hostRef.current);
 
     // Unconditional: a terminal with no connection is still a local shell.
-    connect();
+    const detach = connect(prepareOutput);
 
     return () => {
+      detach?.();
       cancelAnimationFrame(warmup);
       observer.disconnect();
       term.textarea?.removeEventListener("focus", onFocus);
       term.textarea?.removeEventListener("blur", onBlur);
-      unlistenData.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
       ipc.ptyClose(terminalId).catch(() => {});
       term.dispose();

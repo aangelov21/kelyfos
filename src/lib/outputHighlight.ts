@@ -109,10 +109,10 @@ type Phase = "text" | "esc" | "csi" | "string";
  * parser's, which has to survive a chunk ending mid-sequence — no bytes are
  * ever held back, only the knowledge of where we were.
  *
- * Operates on a latin1 string (one character per byte, as `atob` produces) so
- * that a multi-byte UTF-8 character split across chunks stays intact: the
- * patterns are ASCII-only, so no continuation byte can ever be matched, and
- * converting back reproduces the original bytes exactly.
+ * Operates on a latin1 string (one character per byte, as `bytesToLatin1` in
+ * XtermView produces) so that a multi-byte UTF-8 character split across chunks
+ * stays intact: the patterns are ASCII-only, so no continuation byte can ever
+ * be matched, and converting back reproduces the original bytes exactly.
  */
 export function createOutputHighlighter(): (
   chunk: string,

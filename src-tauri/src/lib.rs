@@ -116,6 +116,8 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_close,
+            pty::pty_pause,
+            pty::pty_resume,
             pty::pty_cwd,
             pty::shells_list,
             fonts::fonts_list,

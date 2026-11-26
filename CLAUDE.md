@@ -41,9 +41,11 @@ Rust structs crossing the boundary use `#[serde(rename_all = "camelCase")]`, so
 Command *arguments* are camelCase on the JS side and snake_case in Rust — Tauri
 converts them.
 
-Rust → JS is events, not returns:
+Rust → JS is events and one channel, not returns:
 
-- `pty:data:{terminalId}` — base64 bytes, written straight into xterm
+- Terminal output — raw bytes over the `Channel` passed to `pty_open`, one per
+  session. Paced by the frontend through `pty_pause` / `pty_resume` against
+  xterm's unparsed backlog (`Flow` in `pty/mod.rs`, watermarks in `XtermView`)
 - `pty:status:{terminalId}` — `{ status, message }`
 - `agent:state` — one `AgentSnapshot` per change
 
