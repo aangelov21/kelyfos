@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A local-first SSH and terminal workspace manager"
 authors = ["Spiros Sklavenitis"]
 license = "MIT"
-repository = "https://github.com/spirossorips/kelyfos"
+repository = "https://github.com/aangelov21/kelyfos"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

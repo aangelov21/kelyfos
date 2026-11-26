@@ -22,7 +22,7 @@ terminal.
 ## Install
 
 Download the installer for your platform from the
-[latest release](https://github.com/spirossorips/kelyfos/releases/latest).
+[latest release](https://github.com/aangelov21/kelyfos/releases/latest).
 
 Kelyfos is not code-signed. On macOS, Gatekeeper will refuse the first launch —
 right-click the app → **Open**, or allow it under *System Settings → Privacy &
@@ -172,7 +172,7 @@ The app polls one static JSON file, `plugins.updater.endpoints` in
 `src-tauri/tauri.conf.json`:
 
 ```
-https://github.com/spirossorips/kelyfos/releases/latest/download/latest.json
+https://github.com/aangelov21/kelyfos/releases/latest/download/latest.json
 ```
 
 `releases/latest` always redirects to the newest **published** release, so the
@@ -235,9 +235,9 @@ Planned (stub in `src-tauri/src/modules/mcp`): MCP server and per-workspace
 permissions.
 
 If you fork this, change `identifier` and `plugins.updater.endpoints` in
-`src-tauri/tauri.conf.json` and generate your own signing key before releasing,
-or your builds will look for updates in this repo — and reject them, since the
-public key compiled into them will not match anything you can sign.
+`src-tauri/tauri.conf.json` and generate your own signing key before releasing.
+Otherwise your builds look for updates in this repo and install them: the
+public key compiled into them is this repo's, so its releases verify.
 
 ## Contributing
 
